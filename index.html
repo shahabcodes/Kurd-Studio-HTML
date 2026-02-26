@@ -477,11 +477,13 @@
       border-radius: var(--radius-xl);
       box-shadow: var(--shadow-lg);
       transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+      overflow: hidden;
+      isolation: isolate;
     }
     header::before {
       content: '';
       position: absolute;
-      inset: -1px;
+      inset: 0;
       border-radius: inherit;
       padding: 1px;
       background: linear-gradient(var(--gradient-angle, 135deg), var(--accent), var(--accent-2), var(--accent-3), var(--accent));
@@ -493,6 +495,7 @@
       opacity: 0.4;
       pointer-events: none;
       transition: opacity 0.4s ease;
+      z-index: 0;
     }
     @keyframes flowingGradient {
       0%, 100% { background-position: 0% 50%; }
@@ -512,6 +515,7 @@
       transform-origin: left;
       transition: transform 0.1s linear;
       opacity: 0.8;
+      z-index: 2;
     }
     header.scrolled {
       top: var(--space-sm);
@@ -529,6 +533,18 @@
       gap: var(--space-md);
       height: 100%;
       padding: 0 var(--space-lg);
+      position: relative;
+      z-index: 1;
+    }
+
+    .fluid-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border-radius: inherit;
+      pointer-events: none;
+      z-index: 0;
     }
 
     /* Brand */
@@ -2934,6 +2950,639 @@
     }
     window.addEventListener('load', () => setTimeout(hidePreloader, 500));
     setTimeout(hidePreloader, 3500);
+  </script>
+
+  <!-- Ink in Water: Header Fluid Simulation -->
+  <script>
+  (function() {
+    'use strict';
+
+    // Skip on mobile / touch-only / reduced motion
+    const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+    const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const hasPointer = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+    if (isMobile || prefersReduced || !hasPointer) return;
+
+    // ── FluidSimulation ──────────────────────────────────────────────
+    class FluidSimulation {
+      constructor(headerEl, opts = {}) {
+        this.header = headerEl;
+
+        // Config
+        this.simRes       = opts.simResolution      || 128;
+        this.dyeRes       = opts.dyeResolution       || 256;
+        this.pressureIter = opts.pressureIterations   || 20;
+        this.velDissip    = opts.velocityDissipation  || 0.98;
+        this.dyeDissip    = opts.dyeDissipation       || 0.97;
+        this.splatRadius  = opts.splatRadius           || 0.004;
+        this.ambientMs    = opts.ambientInterval       || 2500;
+
+        // Accent palette (pink / purple / rose)
+        this.colors = [
+          [0.93, 0.29, 0.60],  // #ec4899
+          [0.66, 0.33, 0.97],  // #a855f7
+          [0.98, 0.66, 0.83],  // #f9a8d4
+          [0.75, 0.52, 0.99],  // #c084fc
+        ];
+        this.alphaMultiplier = 0.55;
+
+        // Create canvas
+        this.canvas = document.createElement('canvas');
+        this.canvas.className = 'fluid-canvas';
+        this.header.insertBefore(this.canvas, this.header.firstChild);
+
+        // Init WebGL2
+        this.gl = this.canvas.getContext('webgl2', {
+          alpha: true,
+          premultipliedAlpha: false,
+          preserveDrawingBuffer: false,
+          antialias: false,
+          depth: false,
+          stencil: false,
+        });
+
+        if (!this.gl) {
+          this.canvas.remove();
+          this.disposed = true;
+          return;
+        }
+
+        const gl = this.gl;
+        gl.getExtension('EXT_color_buffer_float');
+        gl.getExtension('OES_texture_float_linear');
+
+        // Compile shaders
+        this._buildShaders();
+
+        // Fullscreen triangle (covers clip space)
+        const verts = new Float32Array([-1,-1, 3,-1, -1,3]);
+        this.vbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+        gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+
+        // Allocate framebuffers
+        this._resize();
+
+        // ResizeObserver
+        this._ro = new ResizeObserver(() => this._resize());
+        this._ro.observe(this.header);
+
+        // Ambient splats
+        this._ambientTimer = setInterval(() => this._ambientSplat(), this.ambientMs);
+
+        this.splatQueue = [];
+        this.disposed = false;
+      }
+
+      // ── Shader source ──────────────────────────────────────────────
+      _vert() {
+        return `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aPos;
+out vec2 vUv;
+void main(){
+  vUv = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+      }
+
+      _splatFrag() {
+        return `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTarget;
+uniform float uAspectRatio;
+uniform vec2 uPoint;
+uniform vec3 uColor;
+uniform float uRadius;
+out vec4 fragColor;
+void main(){
+  vec2 p = vUv - uPoint;
+  p.x *= uAspectRatio;
+  vec3 splat = exp(-dot(p,p) / uRadius) * uColor;
+  vec3 base = texture(uTarget, vUv).xyz;
+  fragColor = vec4(base + splat, 1.0);
+}`;
+      }
+
+      _advectFrag() {
+        return `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uVelocity;
+uniform sampler2D uSource;
+uniform vec2 uTexelSize;
+uniform float uDt;
+uniform float uDissipation;
+out vec4 fragColor;
+void main(){
+  vec2 coord = vUv - uDt * texture(uVelocity, vUv).xy * uTexelSize;
+  fragColor = uDissipation * texture(uSource, coord);
+}`;
+      }
+
+      _divergenceFrag() {
+        return `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uVelocity;
+uniform vec2 uTexelSize;
+out vec4 fragColor;
+void main(){
+  float L = texture(uVelocity, vUv - vec2(uTexelSize.x, 0.0)).x;
+  float R = texture(uVelocity, vUv + vec2(uTexelSize.x, 0.0)).x;
+  float B = texture(uVelocity, vUv - vec2(0.0, uTexelSize.y)).y;
+  float T = texture(uVelocity, vUv + vec2(0.0, uTexelSize.y)).y;
+  float div = 0.5 * (R - L + T - B);
+  fragColor = vec4(div, 0.0, 0.0, 1.0);
+}`;
+      }
+
+      _pressureFrag() {
+        return `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uPressure;
+uniform sampler2D uDivergence;
+uniform vec2 uTexelSize;
+out vec4 fragColor;
+void main(){
+  float L = texture(uPressure, vUv - vec2(uTexelSize.x, 0.0)).x;
+  float R = texture(uPressure, vUv + vec2(uTexelSize.x, 0.0)).x;
+  float B = texture(uPressure, vUv - vec2(0.0, uTexelSize.y)).y;
+  float T = texture(uPressure, vUv + vec2(0.0, uTexelSize.y)).y;
+  float C = texture(uDivergence, vUv).x;
+  float pressure = (L + R + B + T - C) * 0.25;
+  fragColor = vec4(pressure, 0.0, 0.0, 1.0);
+}`;
+      }
+
+      _gradSubFrag() {
+        return `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uPressure;
+uniform sampler2D uVelocity;
+uniform vec2 uTexelSize;
+out vec4 fragColor;
+void main(){
+  float L = texture(uPressure, vUv - vec2(uTexelSize.x, 0.0)).x;
+  float R = texture(uPressure, vUv + vec2(uTexelSize.x, 0.0)).x;
+  float B = texture(uPressure, vUv - vec2(0.0, uTexelSize.y)).y;
+  float T = texture(uPressure, vUv + vec2(0.0, uTexelSize.y)).y;
+  vec2 vel = texture(uVelocity, vUv).xy;
+  vel -= vec2(R - L, T - B) * 0.5;
+  fragColor = vec4(vel, 0.0, 1.0);
+}`;
+      }
+
+      _clearFrag() {
+        return `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTexture;
+uniform float uValue;
+out vec4 fragColor;
+void main(){
+  fragColor = uValue * texture(uTexture, vUv);
+}`;
+      }
+
+      _displayFrag() {
+        return `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uDye;
+uniform float uAlphaMultiplier;
+out vec4 fragColor;
+void main(){
+  vec3 c = texture(uDye, vUv).rgb;
+  float lum = dot(c, vec3(0.299, 0.587, 0.114));
+  fragColor = vec4(c, lum * uAlphaMultiplier);
+}`;
+      }
+
+      // ── Shader compile helpers ─────────────────────────────────────
+      _buildShaders() {
+        const gl = this.gl;
+        const vs = this._compileShader(gl.VERTEX_SHADER, this._vert());
+        this.splatProg    = this._createProgram(vs, this._compileShader(gl.FRAGMENT_SHADER, this._splatFrag()));
+        this.advectProg   = this._createProgram(vs, this._compileShader(gl.FRAGMENT_SHADER, this._advectFrag()));
+        this.divProg      = this._createProgram(vs, this._compileShader(gl.FRAGMENT_SHADER, this._divergenceFrag()));
+        this.pressureProg = this._createProgram(vs, this._compileShader(gl.FRAGMENT_SHADER, this._pressureFrag()));
+        this.gradSubProg  = this._createProgram(vs, this._compileShader(gl.FRAGMENT_SHADER, this._gradSubFrag()));
+        this.clearProg    = this._createProgram(vs, this._compileShader(gl.FRAGMENT_SHADER, this._clearFrag()));
+        this.displayProg  = this._createProgram(vs, this._compileShader(gl.FRAGMENT_SHADER, this._displayFrag()));
+      }
+
+      _compileShader(type, src) {
+        const gl = this.gl;
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        return s;
+      }
+
+      _createProgram(vs, fs) {
+        const gl = this.gl;
+        const p = gl.createProgram();
+        gl.attachShader(p, vs);
+        gl.attachShader(p, fs);
+        gl.linkProgram(p);
+        // Cache uniform locations
+        p._uniforms = {};
+        const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+        for (let i = 0; i < n; i++) {
+          const info = gl.getActiveUniform(p, i);
+          p._uniforms[info.name] = gl.getUniformLocation(p, info.name);
+        }
+        return p;
+      }
+
+      _use(prog) {
+        this.gl.useProgram(prog);
+        this._currentProg = prog;
+      }
+
+      _uni(name, ...args) {
+        const loc = this._currentProg._uniforms[name];
+        if (loc == null) return;
+        const gl = this.gl;
+        if (args.length === 1 && typeof args[0] === 'number') {
+          if (Number.isInteger(args[0])) gl.uniform1i(loc, args[0]);
+          else gl.uniform1f(loc, args[0]);
+        } else if (args.length === 2) gl.uniform2f(loc, args[0], args[1]);
+        else if (args.length === 3) gl.uniform3f(loc, args[0], args[1], args[2]);
+      }
+
+      // ── Framebuffer helpers ────────────────────────────────────────
+      _createDoubleFBO(w, h, internalFormat, format, type, filter) {
+        return {
+          read:  this._createFBO(w, h, internalFormat, format, type, filter),
+          write: this._createFBO(w, h, internalFormat, format, type, filter),
+          swap() { const t = this.read; this.read = this.write; this.write = t; },
+          get width() { return this.read.width; },
+          get height() { return this.read.height; },
+        };
+      }
+
+      _createFBO(w, h, internalFormat, format, type, filter) {
+        const gl = this.gl;
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, w, h, 0, format, type, null);
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+        gl.viewport(0, 0, w, h);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        return { fbo, tex, width: w, height: h };
+      }
+
+      _destroyFBO(fb) {
+        if (!fb) return;
+        const gl = this.gl;
+        if (fb.read) { this._destroyFBO(fb.read); this._destroyFBO(fb.write); return; }
+        gl.deleteTexture(fb.tex);
+        gl.deleteFramebuffer(fb.fbo);
+      }
+
+      // ── Resize ─────────────────────────────────────────────────────
+      _resize() {
+        const gl = this.gl;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const rect = this.header.getBoundingClientRect();
+        const w = Math.round(rect.width * dpr);
+        const h = Math.round(rect.height * dpr);
+        if (w < 1 || h < 1) return;
+
+        this.canvas.width = w;
+        this.canvas.height = h;
+        this.aspect = w / h;
+
+        // Destroy old
+        this._destroyFBO(this.velocity);
+        this._destroyFBO(this.dye);
+        this._destroyFBO(this.pressure);
+        this._destroyFBO(this.divergence);
+
+        // Sim resolution
+        const simW = this.simRes;
+        const simH = Math.max(1, Math.round(this.simRes / this.aspect));
+        const dyeW = this.dyeRes;
+        const dyeH = Math.max(1, Math.round(this.dyeRes / this.aspect));
+
+        const hf = gl.RGBA16F;
+        const rgba = gl.RGBA;
+        const half = gl.HALF_FLOAT;
+        const lin = gl.LINEAR;
+
+        this.velocity   = this._createDoubleFBO(simW, simH, hf, rgba, half, lin);
+        this.dye        = this._createDoubleFBO(dyeW, dyeH, hf, rgba, half, lin);
+        this.pressure   = this._createDoubleFBO(simW, simH, hf, rgba, half, lin);
+        this.divergence = this._createFBO(simW, simH, hf, rgba, half, lin);
+      }
+
+      // ── Draw call ──────────────────────────────────────────────────
+      _blit(target) {
+        const gl = this.gl;
+        if (target) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+          gl.viewport(0, 0, target.width, target.height);
+        } else {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+        }
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
+
+      _bindTex(unit, tex) {
+        const gl = this.gl;
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+      }
+
+      // ── Public API ─────────────────────────────────────────────────
+      splat(x, y, dx, dy, color) {
+        this.splatQueue.push({ x, y, dx, dy, color });
+      }
+
+      splatAtPixel(clientX, clientY, dx, dy, color) {
+        const rect = this.header.getBoundingClientRect();
+        const x = (clientX - rect.left) / rect.width;
+        const y = 1.0 - (clientY - rect.top) / rect.height;
+        if (!color) color = this.colors[Math.floor(Math.random() * this.colors.length)];
+        this.splat(x, y, dx, dy, color);
+      }
+
+      ripple(clientX, clientY, strength = 400) {
+        const rect = this.header.getBoundingClientRect();
+        const cx = (clientX - rect.left) / rect.width;
+        const cy = 1.0 - (clientY - rect.top) / rect.height;
+        const rings = 3;
+        const spokes = 10;
+        for (let r = 0; r < rings; r++) {
+          const radius = (r + 1) * 0.04;
+          const force = strength * (1 - r * 0.3);
+          for (let s = 0; s < spokes; s++) {
+            const angle = (s / spokes) * Math.PI * 2;
+            const dx = Math.cos(angle) * force;
+            const dy = Math.sin(angle) * force;
+            const px = cx + Math.cos(angle) * radius;
+            const py = cy + Math.sin(angle) * radius;
+            const color = this.colors[(r * spokes + s) % this.colors.length];
+            this.splat(px, py, dx, dy, [color[0] * 1.5, color[1] * 1.5, color[2] * 1.5]);
+          }
+        }
+      }
+
+      setColors(palette, alpha) {
+        if (palette) this.colors = palette;
+        if (alpha != null) this.alphaMultiplier = alpha;
+      }
+
+      // ── Simulation step ────────────────────────────────────────────
+      step(dt) {
+        if (this.disposed) return;
+        const gl = this.gl;
+
+        gl.disable(gl.BLEND);
+
+        // Apply queued splats
+        while (this.splatQueue.length) {
+          const s = this.splatQueue.shift();
+          this._applySplat(this.velocity, s.x, s.y, s.dx, s.dy);
+          this._applySplat(this.dye, s.x, s.y, s.color[0], s.color[1], s.color[2]);
+        }
+
+        // Advect velocity
+        this._use(this.advectProg);
+        this._bindTex(0, this.velocity.read.tex);
+        this._bindTex(1, this.velocity.read.tex);
+        this._uni('uVelocity', 0);
+        this._uni('uSource', 1);
+        this._uni('uTexelSize', 1.0 / this.velocity.width, 1.0 / this.velocity.height);
+        this._uni('uDt', dt);
+        this._uni('uDissipation', this.velDissip);
+        this._blit(this.velocity.write);
+        this.velocity.swap();
+
+        // Divergence
+        this._use(this.divProg);
+        this._bindTex(0, this.velocity.read.tex);
+        this._uni('uVelocity', 0);
+        this._uni('uTexelSize', 1.0 / this.velocity.width, 1.0 / this.velocity.height);
+        this._blit(this.divergence);
+
+        // Clear pressure
+        this._use(this.clearProg);
+        this._bindTex(0, this.pressure.read.tex);
+        this._uni('uTexture', 0);
+        this._uni('uValue', 0.8);
+        this._blit(this.pressure.write);
+        this.pressure.swap();
+
+        // Pressure solve (Jacobi)
+        this._use(this.pressureProg);
+        this._uni('uTexelSize', 1.0 / this.velocity.width, 1.0 / this.velocity.height);
+        for (let i = 0; i < this.pressureIter; i++) {
+          this._bindTex(0, this.pressure.read.tex);
+          this._bindTex(1, this.divergence.tex);
+          this._uni('uPressure', 0);
+          this._uni('uDivergence', 1);
+          this._blit(this.pressure.write);
+          this.pressure.swap();
+        }
+
+        // Gradient subtract
+        this._use(this.gradSubProg);
+        this._bindTex(0, this.pressure.read.tex);
+        this._bindTex(1, this.velocity.read.tex);
+        this._uni('uPressure', 0);
+        this._uni('uVelocity', 1);
+        this._uni('uTexelSize', 1.0 / this.velocity.width, 1.0 / this.velocity.height);
+        this._blit(this.velocity.write);
+        this.velocity.swap();
+
+        // Advect dye
+        this._use(this.advectProg);
+        this._bindTex(0, this.velocity.read.tex);
+        this._bindTex(1, this.dye.read.tex);
+        this._uni('uVelocity', 0);
+        this._uni('uSource', 1);
+        this._uni('uTexelSize', 1.0 / this.dye.width, 1.0 / this.dye.height);
+        this._uni('uDt', dt);
+        this._uni('uDissipation', this.dyeDissip);
+        this._blit(this.dye.write);
+        this.dye.swap();
+      }
+
+      _applySplat(target, x, y, r, g, b) {
+        this._use(this.splatProg);
+        this._bindTex(0, target.read.tex);
+        this._uni('uTarget', 0);
+        this._uni('uAspectRatio', this.aspect);
+        this._uni('uPoint', x, y);
+        if (b !== undefined) {
+          this._uni('uColor', r, g, b);
+        } else {
+          // velocity splat: r=dx, g=dy
+          this._uni('uColor', r, g, 0.0);
+        }
+        this._uni('uRadius', this.splatRadius);
+        this._blit(target.write);
+        target.swap();
+      }
+
+      // ── Render to screen ───────────────────────────────────────────
+      render() {
+        if (this.disposed) return;
+        const gl = this.gl;
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        this._use(this.displayProg);
+        this._bindTex(0, this.dye.read.tex);
+        this._uni('uDye', 0);
+        this._uni('uAlphaMultiplier', this.alphaMultiplier);
+        this._blit(null);
+        gl.disable(gl.BLEND);
+      }
+
+      // ── Ambient ────────────────────────────────────────────────────
+      _ambientSplat() {
+        const x = Math.random();
+        const y = Math.random();
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 80 + Math.random() * 120;
+        const color = this.colors[Math.floor(Math.random() * this.colors.length)];
+        this.splat(x, y, Math.cos(angle) * speed, Math.sin(angle) * speed, color);
+      }
+
+      // ── Cleanup ────────────────────────────────────────────────────
+      dispose() {
+        this.disposed = true;
+        clearInterval(this._ambientTimer);
+        this._ro.disconnect();
+        this._destroyFBO(this.velocity);
+        this._destroyFBO(this.dye);
+        this._destroyFBO(this.pressure);
+        this._destroyFBO(this.divergence);
+        const gl = this.gl;
+        gl.deleteBuffer(this.vbo);
+        [this.splatProg, this.advectProg, this.divProg, this.pressureProg,
+         this.gradSubProg, this.clearProg, this.displayProg].forEach(p => gl.deleteProgram(p));
+        this.canvas.remove();
+        this.gl.getExtension('WEBGL_lose_context')?.loseContext();
+      }
+    }
+
+    // ── Boot ───────────────────────────────────────────────────────
+    const headerEl = document.querySelector('header');
+    if (!headerEl) return;
+
+    // Check WebGL2 support
+    const testCanvas = document.createElement('canvas');
+    const testGL = testCanvas.getContext('webgl2');
+    if (!testGL) return;
+    // Check float buffer support
+    const extCBF = testGL.getExtension('EXT_color_buffer_float');
+    if (!extCBF) return;
+    testGL.getExtension('WEBGL_lose_context')?.loseContext();
+
+    const fluidSim = new FluidSimulation(headerEl);
+    if (fluidSim.disposed) return;
+
+    // Color palettes per theme
+    const darkColors = [
+      [0.93, 0.29, 0.60],
+      [0.66, 0.33, 0.97],
+      [0.98, 0.66, 0.83],
+      [0.75, 0.52, 0.99],
+    ];
+    const lightColors = [
+      [0.86, 0.15, 0.46],
+      [0.66, 0.33, 0.97],
+      [0.85, 0.27, 0.93],
+      [0.93, 0.29, 0.60],
+    ];
+
+    function updateFluidTheme() {
+      const isDark = document.documentElement.getAttribute('data-theme') !== 'light';
+      fluidSim.setColors(isDark ? darkColors : lightColors, isDark ? 0.55 : 0.4);
+    }
+    updateFluidTheme();
+
+    // Watch theme changes
+    const themeObserver = new MutationObserver(updateFluidTheme);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+    // ── Mouse interaction ──────────────────────────────────────────
+    let lastMX = 0, lastMY = 0, hasMoved = false;
+    headerEl.addEventListener('mousemove', (e) => {
+      if (hasMoved) {
+        const dx = (e.clientX - lastMX) * 10;
+        const dy = -(e.clientY - lastMY) * 10;
+        const color = fluidSim.colors[Math.floor(Math.random() * fluidSim.colors.length)];
+        fluidSim.splatAtPixel(e.clientX, e.clientY, dx, dy, color);
+      }
+      lastMX = e.clientX;
+      lastMY = e.clientY;
+      hasMoved = true;
+    });
+    headerEl.addEventListener('mouseleave', () => { hasMoved = false; });
+
+    // ── Nav link hover bursts ──────────────────────────────────────
+    document.querySelectorAll('header .nav-link').forEach(link => {
+      link.addEventListener('mouseenter', (e) => {
+        const rect = link.getBoundingClientRect();
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        const spokes = 6;
+        for (let i = 0; i < spokes; i++) {
+          const angle = (i / spokes) * Math.PI * 2;
+          const color = fluidSim.colors[i % fluidSim.colors.length];
+          fluidSim.splatAtPixel(cx, cy, Math.cos(angle) * 200, Math.sin(angle) * 200, color);
+        }
+      });
+    });
+
+    // ── Theme toggle ripple ────────────────────────────────────────
+    const themeBtns = document.querySelectorAll('#themeToggle, #themeToggleMobile');
+    themeBtns.forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const rect = btn.getBoundingClientRect();
+        fluidSim.ripple(rect.left + rect.width / 2, rect.top + rect.height / 2, 500);
+      }, true); // capture phase — fires before the theme toggle handler
+    });
+
+    // ── Animation loop ─────────────────────────────────────────────
+    let lastTime = 0;
+    let animId;
+
+    function loop(time) {
+      animId = requestAnimationFrame(loop);
+      const dt = Math.min((time - lastTime) / 1000, 0.016667);
+      lastTime = time;
+      if (dt <= 0) return;
+      fluidSim.step(dt);
+      fluidSim.render();
+    }
+    animId = requestAnimationFrame(loop);
+
+    // Cleanup on page hide (SPA-safe)
+    window.addEventListener('pagehide', () => {
+      cancelAnimationFrame(animId);
+      themeObserver.disconnect();
+      fluidSim.dispose();
+    });
+  })();
   </script>
 </body>
 </html>
